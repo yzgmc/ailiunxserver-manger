@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建产物（勿上传）
+build/
+dist/
+installer/
+*.spec
+
+# 运行时数据
+.linux-server-agent/
+
+# IDE / 系统
+.vscode/
+.idea/
+Thumbs.db
