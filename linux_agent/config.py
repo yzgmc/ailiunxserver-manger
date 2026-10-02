@@ -27,6 +27,13 @@ PROVIDER_PRESETS: dict = {
         "default_model": "deepseek-v4-flash",
         "needs_key": True,
     },
+    "deepseek_web": {
+        "label": "DeepSeek 网页版(免费)",
+        "base_url": "https://chat.deepseek.com/api/v0",
+        "models": ["deepseek_chat", "deepseek_thinker"],
+        "default_model": "deepseek_chat",
+        "needs_key": True,
+    },
     "openai": {
         "label": "OpenAI",
         "base_url": "https://api.openai.com/v1",

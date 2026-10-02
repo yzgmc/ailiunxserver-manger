@@ -214,3 +214,177 @@ class AIClient:
             raise AIError(f"HTTP {resp.status_code}: {resp.text[:400]}")
         data = resp.json()
         return (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or "(空响应)"
+
+
+# --------------------------------------------------------------------------- #
+# DeepSeek 网页版(免费)客户端 —— 走 chat.deepseek.com 网页端内部接口
+# --------------------------------------------------------------------------- #
+_WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+_WEB_VER = "20241129.1"
+
+
+class WebDeepSeekClient(AIClient):
+    """
+    通过 DeepSeek 网页版 (chat.deepseek.com) 的内部接口对话，免费无需 API Key。
+
+    - api_key 填网页登录凭证 userToken：登录网页版 → F12 → Application
+      → Cookies → userToken
+    - 网页端不支持原生 function calling，强制使用 text 文本工具协议
+    - 模型名含 think/reasoner/r1 时启用深度思考 (thinking_enabled)
+    """
+
+    def __init__(self, api_key: str = "", model: str = "deepseek_chat",
+                 temperature: float = 0.2, max_tokens: int = 8192,
+                 timeout: int = 600):
+        super().__init__(base_url="https://chat.deepseek.com/api/v0",
+                         api_key=api_key, model=model or "deepseek_chat",
+                         temperature=temperature, max_tokens=max_tokens,
+                         tool_style="text", timeout=timeout)
+
+    @property
+    def thinking_enabled(self) -> bool:
+        return any(k in (self.model or "").lower()
+                   for k in ("think", "reasoner", "r1"))
+
+    # -- 请求构造 -------------------------------------------------------- #
+    def _headers(self) -> dict:
+        if not self.api_key:
+            raise AIError(
+                "未配置网页版 userToken。请登录 chat.deepseek.com，按 F12 → "
+                "Application → Cookies → userToken 复制后填入「API Key」。")
+        return {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "Origin": "https://chat.deepseek.com",
+            "Referer": "https://chat.deepseek.com/",
+            "User-Agent": _WEB_UA,
+            "app-version": _WEB_VER,
+            "x-app-version": _WEB_VER,
+            "x-client-platform": "web",
+            "x-client-version": _WEB_VER,
+        }
+
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/chat/completion"
+
+    # -- 消息转换：网页端只认 user/assistant ------------------------------ #
+    def _convert_messages(self, messages: list[dict]) -> list[dict]:
+        sys_parts: list[str] = []
+        rest: list[dict] = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system":
+                if content:
+                    sys_parts.append(content)
+            elif role == "tool":
+                rest.append({"role": "user",
+                             "content": f"<tool_result>{content or '(无输出)'}</tool_result>"})
+            elif role in ("user", "assistant"):
+                rest.append({"role": role, "content": content or ""})
+        if sys_parts:
+            head = "【系统设定 - 必须严格遵守】\n" + "\n\n".join(sys_parts)
+            if rest and rest[0]["role"] == "user":
+                rest[0]["content"] = head + "\n\n" + (rest[0]["content"] or "")
+            else:
+                rest.insert(0, {"role": "user", "content": head})
+        return rest or [{"role": "user", "content": "你好"}]
+
+    @staticmethod
+    def _friendly_http_error(resp: requests.Response) -> str:
+        code = resp.status_code
+        try:
+            detail = resp.json().get("msg") or resp.text[:300]
+        except ValueError:
+            detail = resp.text[:300]
+        if code in (401, 403):
+            return (f"HTTP {code}: 网页版 token 已失效或被风控拦截（{detail}）。"
+                    "请重新登录 chat.deepseek.com，按 F12 → Application → "
+                    "Cookies → userToken 获取最新凭证后更新。")
+        return f"HTTP {code}: {detail}"
+
+    # -- 流式对话 -------------------------------------------------------- #
+    def stream_chat(self, messages: list[dict],
+                    tools: list[dict] | None = None,
+                    on_text=None, on_reasoning=None) -> dict:
+        payload = {
+            "messages": self._convert_messages(messages),
+            "thinking_enabled": self.thinking_enabled,
+            "search_enabled": False,
+            "selected_benchmark_knowledge": [],
+            "search_benchmark_knowledge": [],
+            "file_ids": [],
+        }
+        try:
+            resp = self._session.post(
+                self._endpoint(), headers=self._headers(),
+                json=payload, stream=True, timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise AIError(f"请求失败：{exc}") from exc
+        if resp.status_code >= 400:
+            raise AIError(self._friendly_http_error(resp))
+        return self._consume_web_stream(resp, on_text, on_reasoning)
+
+    def _consume_web_stream(self, resp: requests.Response, on_text, on_reasoning) -> dict:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish_reason: str | None = None
+        try:
+            for raw in resp.iter_lines(decode_unicode=True):
+                if not raw:
+                    continue
+                line = raw.strip()
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if line == "[DONE]":
+                    break
+                if not line.startswith("{"):
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("finish_reason"):
+                    finish_reason = chunk["finish_reason"]
+                r = chunk.get("reasoning_content")
+                if r:
+                    reasoning_parts.append(r)
+                    if on_reasoning:
+                        on_reasoning(r)
+                    continue
+                c = chunk.get("content")
+                if c:
+                    # 网页协议：type=3 思考增量，type=4 正文增量
+                    if chunk.get("type") == 3:
+                        reasoning_parts.append(c)
+                        if on_reasoning:
+                            on_reasoning(c)
+                    else:
+                        content_parts.append(c)
+                        if on_text:
+                            on_text(c)
+        finally:
+            resp.close()
+
+        content = "".join(content_parts)
+        parsed = self.parse_text_tool_calls(content)
+        if parsed:
+            content = re.sub(r"<tool_call>.*?</tool_call>", "", content, flags=re.S).strip()
+            content = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", content, flags=re.S).strip()
+        return {
+            "role": "assistant",
+            "content": content or None,
+            "tool_calls": parsed or None,
+            "reasoning": "".join(reasoning_parts),
+            "finish_reason": finish_reason,
+        }
+
+    # -- 连接测试（网页端无非流式接口，走流式收集） ------------------------ #
+    def simple_chat(self, messages: list[dict]) -> str:
+        msg = self.stream_chat(messages)
+        return msg.get("content") or "(空响应)"

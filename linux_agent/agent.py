@@ -17,7 +17,7 @@ import json
 import time
 from typing import Callable
 
-from .ai_client import AIClient, AIError
+from .ai_client import AIClient, AIError, WebDeepSeekClient
 from .config import ConfigManager
 from .audit import AuditLogger
 from .ssh import SSHManager
@@ -96,9 +96,15 @@ class ServerAgent:
         self.permission = permission or (lambda req: True)
 
         ai = config.get_ai_config()
-        self.client = AIClient(base_url=ai["base_url"], api_key=ai["api_key"],
-                               model=ai["model"], temperature=ai["temperature"],
-                               max_tokens=ai["max_tokens"], tool_style=ai["tool_style"])
+        if ai.get("provider") == "deepseek_web":
+            # 网页版免费 DeepSeek：逆向网页端接口，强制文本工具协议
+            self.client = WebDeepSeekClient(api_key=ai["api_key"], model=ai["model"],
+                                            temperature=ai["temperature"],
+                                            max_tokens=ai["max_tokens"])
+        else:
+            self.client = AIClient(base_url=ai["base_url"], api_key=ai["api_key"],
+                                   model=ai["model"], temperature=ai["temperature"],
+                                   max_tokens=ai["max_tokens"], tool_style=ai["tool_style"])
         self.max_iterations = ai["max_iterations"]
         self.context_budget = int(ai.get("context_budget", 32000) or 32000)
         self._memory = GlobalMemory(config.base_dir)

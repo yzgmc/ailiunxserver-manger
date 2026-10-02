@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from ..ai_client import AIClient
+from ..ai_client import AIClient, WebDeepSeekClient
 from ..audit import AuditLogger
 from ..config import PROVIDER_PRESETS, ConfigManager
 from ..ssh import SSHSession
@@ -194,6 +194,7 @@ class AiConfigDialog(QDialog):
         self.btn_search_test.clicked.connect(self._test_search)
 
         self.provider.currentIndexChanged.connect(self._on_provider_change)
+        self._apply_provider_ui(self.provider.currentData())   # 初始状态（含 web 模式）
         self.btn_test.clicked.connect(self._test)
         btns.accepted.connect(self._save)
         btns.rejected.connect(self.reject)
@@ -210,8 +211,26 @@ class AiConfigDialog(QDialog):
         if preset["default_model"] and (not self.model.text() or
                                        self.model.text() == self._orig_model and key != "custom"):
             self.model.setText(preset["default_model"])
-        self.hint.setText("DeepSeek / OpenAI 需 API Key；LM Studio 无需 Key。" if preset["needs_key"]
-                          else "本地服务（如 LM Studio）通常无需 Key，可直接连接。")
+        self._apply_provider_ui(key)
+
+    def _apply_provider_ui(self, key: str) -> None:
+        """按服务商应用 API Key 提示 / 工具协议等 UI 状态（不改动已填内容）。"""
+        preset = PROVIDER_PRESETS[key]
+        if key == "deepseek_web":
+            self.api_key.setPlaceholderText(
+                "网页版 userToken：登录 chat.deepseek.com → F12 → Application → Cookies → userToken（留空沿用已保存值）")
+            self.hint.setText(
+                "网页版(免费)：无需 API Key，把网页登录凭证 userToken 填入 API Key 框即可，"
+                "由免费网页版模型驱动服务器管理。")
+            # 网页端不支持原生 function calling，锁定文本协议
+            ti = self.tool_style.findData("text")
+            self.tool_style.setCurrentIndex(max(ti, 0))
+            self.tool_style.setEnabled(False)
+        else:
+            self.api_key.setPlaceholderText("sk-…  （留空则沿用已保存的 Key）")
+            self.hint.setText("DeepSeek / OpenAI 需 API Key；LM Studio 无需 Key。" if preset["needs_key"]
+                              else "本地服务（如 LM Studio）通常无需 Key，可直接连接。")
+            self.tool_style.setEnabled(True)
 
     def _collect(self) -> dict:
         """收集字段并返回可写配置（Key 为空时沿用原值）。"""
@@ -239,8 +258,11 @@ class AiConfigDialog(QDialog):
         _busy(self.btn_test, True)
 
         def job():
-            client = AIClient(base_url=data["base_url"], api_key=data["api_key"],
-                              model=data["model"], tool_style="auto")
+            if data["provider"] == "deepseek_web":
+                client = WebDeepSeekClient(api_key=data["api_key"], model=data["model"])
+            else:
+                client = AIClient(base_url=data["base_url"], api_key=data["api_key"],
+                                  model=data["model"], tool_style="auto")
             return client.simple_chat([{"role": "user", "content": "请回复：连接成功"}])
 
         self._test_thread = _JobThread(job, self)
